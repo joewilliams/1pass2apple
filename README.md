@@ -4,7 +4,7 @@ This script attempts to mangle 1password .1pif file formated exports into an App
 
 If you have exported the 1password vault as 1pif file you should be able to do something like this:
 ```
-python3 mangle.py data.1pif > out.csv
+python3 mangle.py ./data.1pif output
 ```
 
 The resulting CSV should import correctly in Apple Passwords. Including secure notes and OTP URIs.
