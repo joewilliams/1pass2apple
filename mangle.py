@@ -1,89 +1,117 @@
 import csv
 import json
 import sys
+import os
+import re
+import shutil
+from pathlib import Path
 
-if len(sys.argv) < 2:
-    print("missing 1pass export filename")
-    exit(1)
+if len(sys.argv) < 3:
+    print("Usage: python3 mangle.py /path/to/data.1pif output_basename")
+    print("Example: python3 mangle.py ./data.1pif shared")
+    sys.exit(1)
 
 filename = sys.argv[1]
-w = csv.writer(sys.stdout)
+basename = sys.argv[2]
+
+export_dir = Path(filename).parent
+attachments_src = export_dir / "attachments"
+
+csv_path = Path(f"{basename}.csv")
+attachments_out = Path(f"attachments_extracted.{basename}")
+attachments_out.mkdir(exist_ok=True)
+
+w = csv.writer(open(csv_path, "w", newline="", encoding="utf-8"))
 w.writerow(['Title', 'URL', 'Username', 'Password', 'Notes', 'OTPAuth'])
 
-with open(filename, 'r') as file:
+with open(filename, 'r', encoding='utf-8', errors='replace') as file:
     for line in file:
         if not line.startswith("{"):
             continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-        data = json.loads(line)
-        title = data['title']
-        username = ''
-        password = ''
-        otpauth = ''
-        note = ''
-        url = ''
-        
-        if 'typeName' in data:
-            if data['typeName'] == 'system.folder.Regular':
-                sys.stderr.write("[{}] skipping folder\n".format(title))
-                continue                
+        title = data.get('title', 'Untitled')
+        uuid = data.get('uuid', '')
 
-        if 'trashed' in data:
-            if data['trashed']:
-                sys.stderr.write('[{}] skipping trash entry\n'.format(title))
-                continue               
+        if data.get('typeName') == 'system.folder.Regular':
+            print(f"[{title}] skipping folder", file=sys.stderr)
+            continue
+        if data.get('trashed'):
+            print(f"[{title}] skipping trash entry", file=sys.stderr)
+            continue
 
-        if 'URLs' in data['secureContents']:
-            # just use the first URL we found
-            url = data['secureContents']['URLs'][0]['url']
+        secure = data.get('secureContents', {})
+        username = password = otpauth = note = url = ''
 
-        # try this password field first but use the one in data['secureContents']['fields'] if it exists later
-        if 'password' in data['secureContents']:
-            password = data['secureContents']['password']
+        # URL
+        if 'URLs' in secure and secure['URLs']:
+            url = secure['URLs'][0].get('url', '')
 
-        if 'fields' in data['secureContents']:
-            for field in data['secureContents']['fields']:
-                if field['name'] == 'Password' or field['name'] == 'password':
-                    password = field['value']
+        # Password
+        if 'password' in secure:
+            password = secure['password']
 
-                if field['name'] == 'Username' or field['name'] == 'username':
-                    username = field['value']
-                
-                if field['name'] == 'Title' or field['name'] == 'title':
-                    title = field['value']
+        # Notes on regular items
+        if 'notesPlain' in secure and secure['notesPlain']:
+            note = secure['notesPlain']
 
-        # if we still haven't found a password try designation
-        if password == '':
-            if 'fields' in data['secureContents']:
-                for field in data['secureContents']['fields']:
-                    if 'designation' in field:
-                        if field['designation'] == 'password':
-                            password = field['value']
+        # Fields
+        if 'fields' in secure:
+            for field in secure['fields']:
+                name = field.get('name', '').lower()
+                value = field.get('value', '')
+                designation = field.get('designation', '').lower()
 
-        # if we still haven't found a username try designation
-        if username == '':
-            if 'fields' in data['secureContents']:
-                for field in data['secureContents']['fields']:
-                    if 'designation' in field:
-                        if field['designation'] == 'username':
-                            username = field['value']
+                if name == 'password' or designation == 'password':
+                    password = value
+                elif name == 'username' or designation == 'username':
+                    username = value
+                elif name == 'title':
+                    title = value
 
-        if 'sections' in  data['secureContents']:
-            for section in data['secureContents']['sections']:
-                if 'fields' in section:
-                    if section['fields'][0]['t'] == 'one-time password':
-                        otpauth = section['fields'][0]['v']
-                    
-                    if data['typeName'] == 'securenotes.SecureNote':
-                        note = section['fields'][0]['v']
+        # Sections (OTP + Secure Notes)
+        if 'sections' in secure:
+            for section in secure['sections']:
+                if 'fields' in section and section['fields']:
+                    first = section['fields'][0]
+                    t = first.get('t', '').lower()
+                    v = first.get('v', '')
+                    if t == 'one-time password':
+                        otpauth = v
+                    if data.get('typeName') == 'securenotes.SecureNote' and not note:
+                        note = v
 
-        # if note is still empty try to grab other possible entries
-        # this might work for typeName's like wallet.government.SsnUS or others
-        if note == '':
-            if 'name' in data['secureContents']:
-                note = "name: {}".format(data['secureContents']['name'])
-        
-            if 'number' in data['secureContents']:
-                note = "{}, number: {}".format(note,data['secureContents']['number'])
+        # Fallback
+        if not note:
+            parts = []
+            if 'name' in secure:
+                parts.append(f"name: {secure['name']}")
+            if 'number' in secure:
+                parts.append(f"number: {secure['number']}")
+            note = ", ".join(parts)
+
+        # Attachments
+        attachment_names = []
+        if attachments_src.exists() and uuid:
+            item_att_dir = attachments_src / uuid
+            if item_att_dir.is_dir():
+                safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)[:80] or uuid
+                dest_dir = attachments_out / safe_title
+                dest_dir.mkdir(exist_ok=True)
+
+                for f in item_att_dir.iterdir():
+                    if f.is_file():
+                        dest = dest_dir / f.name
+                        shutil.copy2(f, dest)
+                        attachment_names.append(f.name)
+
+        if attachment_names:
+            note = (note + f"\n\nAttachments (in attachments_extracted.{basename}): " + ", ".join(attachment_names)).strip()
 
         w.writerow([title, url, username, password, note, otpauth])
+
+print(f"CSV written to: {csv_path.resolve()}", file=sys.stderr)
+print(f"Attachments extracted to: {attachments_out.resolve()}", file=sys.stderr)
